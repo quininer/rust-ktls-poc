@@ -2,6 +2,7 @@
 
 
 extern crate libc;
+extern crate byteorder;
 extern crate webpki;
 extern crate rustls;
 
@@ -14,16 +15,17 @@ use std::os::unix::io::AsRawFd;
 use std::net::TcpStream;
 use std::sync::Arc;
 use libc::setsockopt;
+use byteorder::{ ByteOrder, LittleEndian };
 use webpki::DNSNameRef;
-use rustls::{ ALL_CIPHERSUITES, SupportedCipherSuite, Session, ClientConfig, ClientSession };
+use rustls::{ ALL_CIPHERSUITES, Session, ClientConfig, ClientSession };
 
 use uapi_tls::{ TCP_ULP, SOL_TLS, TLS_TX, tls12_crypto_info_aes_gcm_128 };
 
 
-pub unsafe fn ktls_start<Fd: AsRawFd>(socket: &mut Fd, info: &tls12_crypto_info_aes_gcm_128) -> io::Result<()> {
+pub unsafe fn ktls_start_send<Fd: AsRawFd>(socket: &mut Fd, info: &tls12_crypto_info_aes_gcm_128) -> io::Result<()> {
     let socket = socket.as_raw_fd();
 
-    if setsockopt(socket, SOL_TLS, TCP_ULP, "tls\0".as_ptr() as _, 4) != 0 {
+    if setsockopt(socket, SOL_TLS, TCP_ULP, b"tls\0".as_ptr() as _, 4) != 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -62,19 +64,34 @@ impl<S: Session> Stream<S> {
 
             if let Some(secrets) = self.sess.get_secrets() {
                 let scs = self.sess.get_suite();
-                assert_eq!(scs.enc_key_len, uapi_tls::TLS_CIPHER_AES_GCM_128_KEY_SIZE);
+                assert_eq!(scs.enc_key_len, uapi_tls::TLS_CIPHER_AES_GCM_128_KEY_SIZE as _);
 
                 let key_block = secrets.make_key_block(scs.key_block_len());
-                let mut crypto_info = Default::default();
+                let mut crypto_info = tls12_crypto_info_aes_gcm_128::default();
+
+                let (read_seq, write_seq) = self.sess.get_seq();
+                let (client_key, remaining) = key_block.split_at(scs.enc_key_len);
+                let (server_key, remaining) = remaining.split_at(scs.enc_key_len);
+                let (client_iv, remaining) = remaining.split_at(scs.fixed_iv_len);
+                let (server_iv, remaining) = remaining.split_at(scs.fixed_iv_len);
+                let (explicit_nonce_offs, _) = remaining.split_at(scs.explicit_nonce_len);
+
+                // TODO
+                // seq/rec_seq
 
                 if secrets.randoms.we_are_client {
-                    // TODO
+                    crypto_info.key.copy_from_slice(client_key);
+                    crypto_info.salt.copy_from_slice(client_iv);
+                    LittleEndian::write_u64(&mut crypto_info.iv, write_seq);
+                    LittleEndian::write_u64(&mut crypto_info.rec_seq, write_seq);
                 } else {
-                    // TODO
+                    crypto_info.key.copy_from_slice(server_key);
+                    crypto_info.salt.copy_from_slice(server_iv);
+                    LittleEndian::write_u64(&mut crypto_info.iv, read_seq);
                 }
 
                 unsafe {
-                    ktls_start(&mut self.sock, &crypto_info)?;
+                    ktls_start_send(&mut self.sock, &crypto_info)?;
                 }
             }
         }
@@ -87,6 +104,22 @@ impl<S: Session> Read for Stream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.handshake()?;
 
-        self.sock.read(buf)
+        if self.sess.wants_read() {
+            self.sess.complete_io(&mut self.sock)?;
+        }
+
+        self.sess.read(buf)
+    }
+}
+
+impl<S: Session> Write for Stream<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.handshake()?;
+
+        self.sock.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sock.flush()
     }
 }
