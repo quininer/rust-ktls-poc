@@ -25,11 +25,11 @@ use uapi_tls::{ TCP_ULP, SOL_TLS, TLS_TX, tls12_crypto_info_aes_gcm_128 };
 pub unsafe fn ktls_start_send<Fd: AsRawFd>(socket: &mut Fd, info: &tls12_crypto_info_aes_gcm_128) -> io::Result<()> {
     let socket = socket.as_raw_fd();
 
-    if setsockopt(socket, SOL_TLS, TCP_ULP, b"tls\0".as_ptr() as _, 4) != 0 {
+    if setsockopt(socket, SOL_TLS, TCP_ULP, b"tls\0".as_ptr() as _, 4) < 0 {
         return Err(io::Error::last_os_error());
     }
 
-    if setsockopt(socket, SOL_TLS, TLS_TX as _, info as *const _ as _, mem::size_of::<tls12_crypto_info_aes_gcm_128>() as _) != 0 {
+    if setsockopt(socket, SOL_TLS, TLS_TX as _, info as *const _ as _, mem::size_of::<tls12_crypto_info_aes_gcm_128>() as _) < 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -73,11 +73,7 @@ impl<S: Session> Stream<S> {
                 let (client_key, remaining) = key_block.split_at(scs.enc_key_len);
                 let (server_key, remaining) = remaining.split_at(scs.enc_key_len);
                 let (client_iv, remaining) = remaining.split_at(scs.fixed_iv_len);
-                let (server_iv, remaining) = remaining.split_at(scs.fixed_iv_len);
-                let (explicit_nonce_offs, _) = remaining.split_at(scs.explicit_nonce_len);
-
-                // TODO
-                // seq/rec_seq
+                let (server_iv, _) = remaining.split_at(scs.fixed_iv_len);
 
                 if secrets.randoms.we_are_client {
                     crypto_info.key.copy_from_slice(client_key);
