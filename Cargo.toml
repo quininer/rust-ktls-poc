@@ -6,8 +6,8 @@ authors = ["quininer <quininer@live.com>"]
 [dependencies]
 libc = "*"
 byteorder = "*"
-webpki = { git = "https://github.com/briansmith/webpki" }
-rustls = { git = "https://github.com/quininer/rustls", branch = "pub-secrets" }
+webpki = "*"
+rustls = { git = "https://github.com/quininer/rustls", branch = "ktls" }
 
 [dev-dependencies]
-webpki-roots = { git = "https://github.com/briansmith/webpki-roots", branch = "webpki-github" }
+webpki-roots = "*"

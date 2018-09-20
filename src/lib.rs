@@ -15,17 +15,17 @@ use std::os::unix::io::AsRawFd;
 use std::net::TcpStream;
 use std::sync::Arc;
 use libc::setsockopt;
-use byteorder::{ ByteOrder, LittleEndian };
+use byteorder::{ ByteOrder, NetworkEndian };
 use webpki::DNSNameRef;
 use rustls::{ ALL_CIPHERSUITES, Session, ClientConfig, ClientSession };
 
-use uapi_tls::{ TCP_ULP, SOL_TLS, TLS_TX, tls12_crypto_info_aes_gcm_128 };
+use uapi_tls::{ TCP_ULP, SOL_TCP, SOL_TLS, TLS_TX, tls12_crypto_info_aes_gcm_128 };
 
 
 pub unsafe fn ktls_start_send<Fd: AsRawFd>(socket: &mut Fd, info: &tls12_crypto_info_aes_gcm_128) -> io::Result<()> {
     let socket = socket.as_raw_fd();
 
-    if setsockopt(socket, SOL_TLS, TCP_ULP, b"tls\0".as_ptr() as _, 4) < 0 {
+    if setsockopt(socket, SOL_TCP, TCP_ULP, b"tls\0".as_ptr() as _, 4) < 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -46,7 +46,6 @@ pub struct Stream<S> {
 impl Stream<ClientSession> {
     pub fn from_client_config(mut config: ClientConfig, name: DNSNameRef, sock: TcpStream) -> Self {
         config.ciphersuites.clear();
-        config.ciphersuites.push(ALL_CIPHERSUITES[2]);
         config.ciphersuites.push(ALL_CIPHERSUITES[6]);
         config.ciphersuites.push(ALL_CIPHERSUITES[8]);
         Self::new(ClientSession::new(&Arc::new(config), name), sock)
@@ -63,27 +62,29 @@ impl<S: Session> Stream<S> {
             self.sess.complete_io(&mut self.sock)?;
 
             if let Some(secrets) = self.sess.get_secrets() {
-                let scs = self.sess.get_suite();
+                let scs = self.sess.get_negotiated_ciphersuite().unwrap();
                 assert_eq!(scs.enc_key_len, uapi_tls::TLS_CIPHER_AES_GCM_128_KEY_SIZE as _);
 
+                let (_, write_seq) = self.sess.get_seq();
                 let key_block = secrets.make_key_block(scs.key_block_len());
                 let mut crypto_info = tls12_crypto_info_aes_gcm_128::default();
 
-                let (read_seq, write_seq) = self.sess.get_seq();
                 let (client_key, remaining) = key_block.split_at(scs.enc_key_len);
                 let (server_key, remaining) = remaining.split_at(scs.enc_key_len);
                 let (client_iv, remaining) = remaining.split_at(scs.fixed_iv_len);
-                let (server_iv, _) = remaining.split_at(scs.fixed_iv_len);
+                let (server_iv, remaining) = remaining.split_at(scs.fixed_iv_len);
+                let (nonce, _) = remaining.split_at(scs.explicit_nonce_len);
 
                 if secrets.randoms.we_are_client {
                     crypto_info.key.copy_from_slice(client_key);
                     crypto_info.salt.copy_from_slice(client_iv);
-                    LittleEndian::write_u64(&mut crypto_info.iv, write_seq);
-                    LittleEndian::write_u64(&mut crypto_info.rec_seq, write_seq);
+                    crypto_info.iv.copy_from_slice(nonce);
+                    NetworkEndian::write_u64(&mut crypto_info.rec_seq, write_seq);
                 } else {
                     crypto_info.key.copy_from_slice(server_key);
                     crypto_info.salt.copy_from_slice(server_iv);
-                    LittleEndian::write_u64(&mut crypto_info.iv, read_seq);
+                    crypto_info.iv.copy_from_slice(nonce);
+                    NetworkEndian::write_u64(&mut crypto_info.rec_seq, write_seq);
                 }
 
                 unsafe {
@@ -104,7 +105,11 @@ impl<S: Session> Read for Stream<S> {
             self.sess.complete_io(&mut self.sock)?;
         }
 
-        self.sess.read(buf)
+        match self.sess.read(buf) {
+            Ok(n) => Ok(n),
+            Err(ref e) if e.kind() == io::ErrorKind::ConnectionAborted => Ok(0),
+            Err(e) => Err(e)
+        }
     }
 }
 
